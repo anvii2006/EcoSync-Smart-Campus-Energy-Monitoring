@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EcoSync energy telemetry API, processing and data storage
+
+Parameters:
+  FrontendOrigin:
+    Type: String
+    AllowedPattern: '^https://[A-Za-z0-9.-]+(:[0-9]+)?$'
+    Description: Amplify branch HTTPS origin, without a trailing slash
+  WriteToken:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    AllowedPattern: '^[A-Za-z0-9_-]+$'
+    Description: Simulator and configuration bearer token
+
+Resources:
+  EnergyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1
+      EndpointConfiguration: REGIONAL
+      Cors:
+        AllowOrigin: !Sub "'${FrontendOrigin}'"
+        AllowMethods: "'GET,POST,PUT,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        MaxAge: "'600'"
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${FrontendOrigin}'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${FrontendOrigin}'"
+
+  LambdaLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-processor
+      RetentionInDays: 7
+
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EcoSyncTelemetry
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query]
+                Resource: !GetAtt EnergyTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt EnergyTable.Arn
+                Condition:
+                  StringEquals:
+                    dynamodb:EnclosingOperation: TransactWriteItems
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LambdaLogs.Arn
+
+  Processor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-processor
+      CodeUri: backend/
+      Handler: lambda_app.handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 256
+      Timeout: 10
+      Role: !GetAtt ProcessorRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EnergyTable
+          ALLOWED_ORIGIN: !Ref FrontendOrigin
+          WRITE_TOKEN: !Ref WriteToken
+      Events:
+        Ingest:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /readings, Method: post}
+        Readings:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /readings, Method: get}
+        Rooms:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /rooms, Method: get}
+        Analytics:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /analytics, Method: get}
+        Alerts:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /alerts, Method: get}
+        GetConfig:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /config, Method: get}
+        SetConfig:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /config, Method: put}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1
+  TableName:
+    Value: !Ref EnergyTable
+  LogGroup:
+    Value: !Ref LambdaLogs
